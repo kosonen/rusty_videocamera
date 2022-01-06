@@ -1,19 +1,20 @@
 #![no_std]
 #![no_main]
 
-use longan_nano::hal::eclic::{EclicExt, Level, LevelPriorityBits, Priority, TriggerType};
-use longan_nano::hal::gpio::gpiob::PB9;
-use longan_nano::hal::gpio::{Floating, Input, OpenDrain, Output, PullDown, PushPull, State};
-use longan_nano::hal::timer::{Event, Timer};
-use longan_nano::lcd::Lcd;
-use riscv_rt::entry;
-use panic_halt as _;
+use embedded_graphics::image::{ImageRaw, Image};
+use embedded_graphics::pixelcolor::raw::LittleEndian;
 use embedded_graphics::prelude::*;
 use embedded_graphics::pixelcolor::{ Rgb565};
+use embedded_hal::digital::v2::{InputPin, OutputPin};
+use longan_nano::hal::eclic::{EclicExt, Level, LevelPriorityBits, Priority, TriggerType};
+use longan_nano::hal::gpio::{Input, Output, PullDown, PushPull, State};
+use longan_nano::hal::timer::{Event, Timer};
 use longan_nano::hal::{pac, prelude::*, gpio::gpioc::*, gpio::gpioa::*};
 use longan_nano::{lcd_pins,lcd};
-use embedded_hal::digital::v2::{InputPin, OutputPin, StatefulOutputPin};
-use longan_nano::hal::delay::McycleDelay;
+use riscv_rt::entry;
+use panic_halt as _;
+
+
 
 pub struct DataPins
 {
@@ -28,9 +29,8 @@ pub struct DataPins
 
 }
 
-const NUMBER_OF_ROWS: u8 = 160;
-const NUMBER_OF_COLUMNS : u8 = 80;
-const NUMBER_OF_PIXELS : u16 = 12800;
+const NUMBER_OF_COLUMNS : u16 = 160;
+const NUMBER_OF_ROWS : u16 = 80;
 static mut CLK_PIN : Option<PA9<Output<PushPull>>> = None;
 static mut CAMERA_CLOCK_STATE : bool = false;
 static mut TIMER : Option<Timer<longan_nano::hal::pac::TIMER1>> = None;
@@ -41,22 +41,17 @@ fn main() -> ! {
     let mut rcu = dp
     .RCU
     .configure()
-    .ext_hf_clock(8.mhz())
+    .ext_hf_clock(30.mhz())
     .sysclk(108.mhz())
     .freeze();
-
     
     let mut afio = dp.AFIO.constrain(&mut rcu);
-
     let gpioa = dp.GPIOA.split(&mut rcu);
-    let gpiob = dp.GPIOB.split(&mut rcu);
-    
+    let gpiob = dp.GPIOB.split(&mut rcu);    
     let gpioc = dp.GPIOC.split(&mut rcu);
-
 
     let lcd_pins = lcd_pins!(gpioa, gpiob);
     let mut lcd = lcd::configure(dp.SPI0, lcd_pins, &mut afio, &mut rcu);
-    let (width, height) = (lcd.size().width as i32, lcd.size().height as i32);
     lcd.clear(Rgb565::BLACK).unwrap();
      let data_pins = DataPins{
         pin0 : gpioa.pa2.into_pull_down_input(),
@@ -68,19 +63,18 @@ fn main() -> ! {
         pin6 : gpioa.pa3.into_pull_down_input(),
         pin7 : gpioa.pa4.into_pull_down_input(),
     };
-    let mut clk_pin = gpioa.pa9.into_push_pull_output_with_state(State::Low);
-    let mut delay = McycleDelay::new(&rcu.clocks);
+    let clk_pin = gpioa.pa9.into_push_pull_output_with_state(State::Low);
 
     let href = gpioa.pa12;
-    let read_clk = gpiob.pb9;
+    let pclk = gpiob.pb9;
+    let mut byte_handled = false;
 
-    let mut rgb_bytes = [[0u8 ; NUMBER_OF_ROWS as usize]; NUMBER_OF_COLUMNS as usize];
     let mut counter_row: u16 = 0;
     let mut counter_column: u16 = 0;
-    let mut test_bytes = [0u8; 255];
+    let bytes = [0u8; 25600];
     let mut test_counter: usize = 0;
- 
-    
+    let mut href_was_down = false;
+  
     longan_nano::hal::pac::ECLIC::reset();
     longan_nano::hal::pac::ECLIC::set_level_priority_bits(LevelPriorityBits::L3P1);
     longan_nano::hal::pac::ECLIC::set_threshold_level(Level::L0);
@@ -100,15 +94,37 @@ fn main() -> ! {
         unsafe
         {   
             riscv::asm::wfi();
-            // Clock rises   
-            if CAMERA_CLOCK_STATE
-            {
-            }
-            // Clock lowers
-            else 
-            {
-            }
         }
+            if href.is_high().unwrap()
+            {
+                href_was_down = false;
+                if counter_column <= NUMBER_OF_COLUMNS * 2 && !byte_handled && pclk.is_high().unwrap()
+                {
+                    handle_byte(&data_pins, bytes, test_counter);
+                    byte_handled = true;
+                    test_counter += 1;
+                    counter_column += 1;
+                }
+                else if pclk.is_low().unwrap()
+                {
+                    byte_handled = false;
+                }
+            }
+            else if !href_was_down
+            {
+                counter_row += 1;
+                test_counter = 0;
+                href_was_down = true;
+            }
+            if counter_row > NUMBER_OF_ROWS
+            {
+                let raw_image: ImageRaw<Rgb565, LittleEndian> = ImageRaw::new(&bytes, 80);
+                Image::new(&raw_image, Point::new(0,0))
+                    .draw(&mut lcd)
+                    .unwrap();
+            }
+
+        
         
     }
 }
@@ -119,8 +135,7 @@ fn main() -> ! {
 #[no_mangle]
 fn TIMER1 ()
 {
-    unsafe{
-        TIMER.as_mut().unwrap().clear_update_interrupt_flag();
+    unsafe{        
         if !CAMERA_CLOCK_STATE
         {
             CAMERA_CLOCK_STATE = true;
@@ -131,11 +146,28 @@ fn TIMER1 ()
             CAMERA_CLOCK_STATE = false;
             CLK_PIN.as_mut().unwrap().set_low().unwrap();
         }
-         
-
-        
-        
+        TIMER.as_mut().unwrap().clear_update_interrupt_flag();           
     }
-    
+}
 
+fn handle_byte(pins : &DataPins, mut rgb_array : [u8 ; 25600], i : usize)
+{
+    let mut byte : u8 = 0;
+    byte |= pins.pin0.is_high().unwrap() as u8;
+    byte  = byte << 1;
+    byte |= pins.pin1.is_high().unwrap() as u8;
+    byte  = byte << 1;
+    byte |= pins.pin2.is_high().unwrap() as u8;
+    byte  = byte << 1;
+    byte |= pins.pin3.is_high().unwrap() as u8;
+    byte  = byte << 1;
+    byte |= pins.pin4.is_high().unwrap() as u8;
+    byte  = byte << 1;
+    byte |= pins.pin5.is_high().unwrap() as u8;
+    byte  = byte << 1;
+    byte |= pins.pin6.is_high().unwrap() as u8;
+    byte  = byte << 1;
+    byte |= pins.pin7.is_high().unwrap() as u8;
+    byte  = byte << 1;
+    rgb_array[i] = byte;
 }
